@@ -76,6 +76,7 @@ PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb, __in PWCHAR FileName,
 
   fcb->AdvancedFCBHeader.IsFastIoPossible = FastIoIsNotPossible;
   FsRtlInitializeOplock(DokanGetFcbOplock(fcb));
+  fcb->BackoutOplock = FALSE;
 
   fcb->FileName.Buffer = FileName;
   fcb->FileName.Length = (USHORT)FileNameLength;
@@ -473,7 +474,6 @@ Return Value:
   PSECURITY_DESCRIPTOR newFileSecurityDescriptor = NULL;
   BOOLEAN OpenRequiringOplock = FALSE;
   BOOLEAN UnwindShareAccess = FALSE;
-  BOOLEAN BackoutOplock = FALSE;
   BOOLEAN EventContextConsumed = FALSE;
   DWORD disposition = 0;
 
@@ -1208,7 +1208,7 @@ Return Value:
       // if we fail after this point, the oplock will need to be backed out
       // if the oplock was granted (status == STATUS_SUCCESS)
       if (status == STATUS_SUCCESS) {
-        BackoutOplock = TRUE;
+        fcb->BackoutOplock = TRUE;
       }
     }
 
@@ -1234,10 +1234,11 @@ Return Value:
     //  Also unwind any share access that was added to the fcb
 
     if (!NT_SUCCESS(status)) {
-      if (BackoutOplock) {
+      if (fcb && fcb->BackoutOplock) {
         FsRtlCheckOplockEx(DokanGetFcbOplock(fcb), Irp,
                            OPLOCK_FLAG_BACK_OUT_ATOMIC_OPLOCK, NULL, NULL,
                            NULL);
+        fcb->BackoutOplock = FALSE;
       }
 
       if (UnwindShareAccess) {
@@ -1379,6 +1380,10 @@ VOID DokanCompleteCreate(__in PIRP_ENTRY IrpEntry,
   } else {
     DDbgPrint("   IRP_MJ_CREATE failed. Free CCB:%p. Status 0x%x\n", ccb,
               status);
+    if (fcb->BackoutOplock) {
+      FsRtlCheckOplockEx(DokanGetFcbOplock(fcb), irp,
+                         OPLOCK_FLAG_BACK_OUT_ATOMIC_OPLOCK, NULL, NULL, NULL);
+    }
     DokanFreeCCB(ccb);
     IoRemoveShareAccess(irpSp->FileObject, &fcb->ShareAccess);
     DokanFCBUnlock(fcb);
