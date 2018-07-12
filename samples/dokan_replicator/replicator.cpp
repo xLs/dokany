@@ -57,23 +57,25 @@ static size_t CurrentRootDirectory = 0;
 
 struct ReplicationHandle
 	{
-		ReplicationHandle(const std::wstring &path_, bool isMaster = false) { outOfSync = false; master = isMaster; handle = 0; lastStatus = 0; path = path_; }
+		ReplicationHandle(const std::wstring &path_, bool isMaster = false) 
+		{ 
+			outOfSync = false; master = isMaster; handle = 0; lastStatus = 0; path = path_; 
+		}
 		
 		ReplicationHandle(const ReplicationHandle&) = default;
 		
 		operator HANDLE() { return handle;}
 
-		void GetFilePath(PWCHAR filePath, ULONG numberOfElements, LPCWSTR FileName) 
+		void MakeFilePath(PWCHAR filePath, ULONG numberOfElements, LPCWSTR FileName) 
 		{
-
 			wcsncpy_s(filePath, numberOfElements, path.c_str(), wcslen(path.c_str()));
 			size_t unclen = wcslen(UNCName);
-
 			if (unclen > 0 && _wcsnicmp(FileName, UNCName, unclen) == 0) 
 			{
 				if (_wcsnicmp(FileName + unclen, L".", 1) != 0) 
 				{
-					wcsncat_s(filePath, numberOfElements, FileName + unclen, wcslen(FileName) - unclen);
+					wcsncat_s(filePath, numberOfElements, FileName + unclen,
+					wcslen(FileName) - unclen);
 				}
 			} 
 			else 
@@ -81,10 +83,33 @@ struct ReplicationHandle
 				wcsncat_s(filePath, numberOfElements, FileName, wcslen(FileName));
 			}
 		}
+
+		void MakeFilePath(LPCWSTR FileName) 
+		{
+			if(resolved_path.size() == 0)
+			{
+				resolved_path.resize(DOKAN_MAX_PATH);
+				wcsncpy_s(&resolved_path[0], DOKAN_MAX_PATH, path.c_str(), wcslen(path.c_str()));
+				size_t unclen = wcslen(UNCName);
+
+				if (unclen > 0 && _wcsnicmp(FileName, UNCName, unclen) == 0) 
+				{
+					if (_wcsnicmp(FileName + unclen, L".", 1) != 0) 
+					{
+						wcsncat_s(&resolved_path[0], DOKAN_MAX_PATH, FileName + unclen, wcslen(FileName) - unclen);
+					}
+				} 
+				else 
+				{
+					wcsncat_s(&resolved_path[0], DOKAN_MAX_PATH, FileName, wcslen(FileName));
+				}
+			}
+		}
 		bool outOfSync;
 		bool master;
 		HANDLE handle;
 		std::wstring path;
+		std::wstring resolved_path;
 		NTSTATUS lastStatus;
 	};
 
@@ -114,21 +139,12 @@ public:
 
 private:
 	ReplicatedFile() 
-	{
-		SynchronizeHandles();
-	}
-	~ReplicatedFile()
-	{
-		
+	{ 
+		_master = _handles.end();
+		SynchronizeHandles(); 
 	}
 
-protected:
-
-	void SyncronizeFT()
-	{
-
-	}
-
+	~ReplicatedFile() 	{   }
 public:
 
 	void Release()
@@ -191,6 +207,8 @@ public:
 
 	BOOL IntegrityCheck(LPCWSTR FileName, PDOKAN_FILE_INFO dokan_file_info)
 	{
+		return TRUE;
+		if(wcslen(FileName) <2) return TRUE;
 		auto latestHandle = GetLatestModified(FileName,dokan_file_info);
 		if(latestHandle == _handles.end()) 
 			return TRUE; // All ok :) kindof
@@ -200,12 +218,10 @@ public:
 		{
 			if(rh != latestHandle && rh->outOfSync)
 			{
-				WCHAR sourcefilePath[DOKAN_MAX_PATH];
-				WCHAR destfilePath[DOKAN_MAX_PATH];
-				latestHandle->GetFilePath(sourcefilePath, DOKAN_MAX_PATH, FileName);
-				rh->GetFilePath(sourcefilePath, DOKAN_MAX_PATH, FileName);
-				::CopyFile( sourcefilePath, destfilePath, FALSE);
+				::CopyFile( latestHandle->resolved_path.c_str(), rh->resolved_path.c_str(), FALSE);
+				printf("Copy out of sync file\n");
 			}
+			++rh;
 		}
 		SynchronizeFT(FileName,dokan_file_info);
 		return TRUE;
@@ -219,31 +235,42 @@ public:
 		std::vector<BY_HANDLE_FILE_INFORMATION> fi;
 		FILETIME ft = {0};
 		auto latestHandle = _handles.end();
-		fi.reserve(_handles.size());
+		fi.resize(_handles.size());
 		auto fit = fi.begin();
 		while(rh != _handles.end()) // remove no longer paths
 		{
 			FILETIME* ft2 = &fit->ftLastWriteTime;
 			ReplicatedGetFileInformation(&*rh ,FileName,&*fit++,dokan_file_info);
-			int c = CompareFileTime(&ft, ft2);
-			if( c != 0) 
+			if(rh == _handles.begin())
 			{
-				if(c > 0)
+				latestHandle = rh;
+				ft = *ft2;
+			}
+			else
+			{
+				int c = CompareFileTime(&ft, ft2);
+				if( c != 0) 
 				{
-					latestHandle->outOfSync = true; // previous is older
-					latestHandle = rh;
-					ft = *ft2;
-				}else
-				{
-					rh->outOfSync = true; // current is older
+					if(c < 0)
+					{
+						latestHandle->outOfSync = true; // previous is older
+						latestHandle = rh;
+						ft = *ft2;
+					}else
+					{
+						rh->outOfSync = true; // current is older
+						printf("File out of sync\n");
+					}
 				}
 			}
+			++rh;
 		}
 		return latestHandle; // returns end() iterator if all are the same
 	}
 
 	void SynchronizeFT(LPCWSTR FileName, PDOKAN_FILE_INFO dokan_file_info)
 	{
+		return;
 		if(_master != _handles.end())
 		{
 			BY_HANDLE_FILE_INFORMATION fi = {0};
@@ -258,10 +285,11 @@ public:
 				if(rh != _master)
 				{
 					auto stat = rh->lastStatus; // lets not overwrite status
-					ReplicatedSetFileTime(&*rh,FileName, &fi.ftCreationTime, &fi.ftLastAccessTime, &fi.ftLastAccessTime, dokan_file_info);
+					ReplicatedSetFileTime(&*rh,FileName, &fi.ftCreationTime, &fi.ftLastAccessTime, &fi.ftLastWriteTime, dokan_file_info);
 					rh->lastStatus = stat;
 					rh->outOfSync = false;
 				}
+				++rh;
 			}
 		}
 	}
@@ -273,6 +301,7 @@ public:
 		while(rh != _handles.end()) // remove no longer paths
 		{
 			if(rh->master == true) { master = rh; found = true; break; }
+			++rh;
 		}
 		if(!found) master = _handles.begin(); // can be end()
 		if(master != _master)
@@ -296,6 +325,7 @@ BOOL g_DebugMode;
 BOOL g_HasSeSecurityPrivilege;
 BOOL g_ImpersonateCallerUser;
 
+#ifdef _DEBUG
 static void DbgPrint(LPCWSTR format, ...) {
   if (g_DebugMode) {
     const WCHAR *outputString;
@@ -323,7 +353,9 @@ static void DbgPrint(LPCWSTR format, ...) {
       fflush(stderr);
   }
 }
-
+#else
+static void DbgPrint(LPCWSTR format, ...) { }
+#endif
 
 
 static void GetFilePath(PWCHAR filePath, ULONG numberOfElements, LPCWSTR FileName) {
@@ -445,8 +477,8 @@ static BOOL AddSeSecurityNamePrivilege() {
 ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
                  ACCESS_MASK DesiredAccess, ULONG FileAttributes,
                  ULONG ShareAccess, ULONG CreateDisposition,
-                 ULONG CreateOptions, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[DOKAN_MAX_PATH];
+                 ULONG CreateOptions, PDOKAN_FILE_INFO DokanFileInfo, bool& file_opened) {
+  
   
   DWORD fileAttr;
   NTSTATUS status = STATUS_SUCCESS;
@@ -457,7 +489,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
   ACCESS_MASK genericDesiredAccess;
   // userTokenHandle is for Impersonate Caller User Option
   HANDLE userTokenHandle = INVALID_HANDLE_VALUE;
-
+  file_opened = false;
   securityAttrib.nLength = sizeof(securityAttrib);
   securityAttrib.lpSecurityDescriptor =
     SecurityContext->AccessState.SecurityDescriptor;
@@ -467,9 +499,9 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
       DesiredAccess, FileAttributes, CreateOptions, CreateDisposition,
 	  &genericDesiredAccess, &fileAttributesAndFlags, &creationDisposition);
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
-
-  DbgPrint(L"CreateFile : %s\n", filePath);
+  
+  rep_handle->MakeFilePath(FileName);
+  DbgPrint(L"CreateFile : %s\n", rep_handle->resolved_path.c_str());
 
   PrintUserName(DokanFileInfo);
 
@@ -511,7 +543,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
 
   // When filePath is a directory, needs to change the flag so that the file can
   // be opened.
-  fileAttr = GetFileAttributes(filePath);
+  fileAttr = GetFileAttributes(rep_handle->resolved_path.c_str());
 
   if (fileAttr != INVALID_FILE_ATTRIBUTES
     && fileAttr & FILE_ATTRIBUTE_DIRECTORY) {
@@ -601,7 +633,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
       }
 
       //We create folder
-      if (!CreateDirectory(filePath, &securityAttrib)) {
+      if (!CreateDirectory(rep_handle->resolved_path.c_str(), &securityAttrib)) {
         error = GetLastError();
         // Fail to create folder for OPEN_ALWAYS is not an error
         if (error != ERROR_ALREADY_EXISTS ||
@@ -640,7 +672,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
 
       // FILE_FLAG_BACKUP_SEMANTICS is required for opening directory handles
       HANDLE handle =
-        CreateFile(filePath, genericDesiredAccess, ShareAccess,
+        CreateFile(rep_handle->resolved_path.c_str(), genericDesiredAccess, ShareAccess,
                    &securityAttrib, OPEN_EXISTING,
                    fileAttributesAndFlags | FILE_FLAG_BACKUP_SEMANTICS, NULL);
 
@@ -659,7 +691,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
         status = DokanNtStatusFromWin32(error);
       } else {
         rep_handle->handle = handle; // save the file handle in Context
-
+		
         // Open succeed but we need to inform the driver
         // that the dir open and not created by returning STATUS_OBJECT_NAME_COLLISION
         if (creationDisposition == OPEN_ALWAYS &&
@@ -700,7 +732,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
     }
 
     HANDLE handle = CreateFile(
-                        filePath,
+                        rep_handle->resolved_path.c_str(),
         genericDesiredAccess, // GENERIC_READ|GENERIC_WRITE|GENERIC_EXECUTE,
                         ShareAccess,
                         &securityAttrib, // security attribute
@@ -726,11 +758,11 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
       //Need to update FileAttributes with previous when Overwrite file
       if (fileAttr != INVALID_FILE_ATTRIBUTES &&
           creationDisposition == TRUNCATE_EXISTING) {
-        SetFileAttributes(filePath, fileAttributesAndFlags | fileAttr);
+        SetFileAttributes(rep_handle->resolved_path.c_str(), fileAttributesAndFlags | fileAttr);
       }
 
       rep_handle->handle = handle; // save the file handle in Context
-
+	  
       if (creationDisposition == OPEN_ALWAYS ||
           creationDisposition == CREATE_ALWAYS) {
         error = GetLastError();
@@ -738,6 +770,7 @@ ReplicatedCreateFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_IO_
           DbgPrint(L"\tOpen an already existing file\n");
           // Open succeed but we need to inform the driver
           // that the file open and not created by returning STATUS_OBJECT_NAME_COLLISION
+		  file_opened = true;
           status = STATUS_OBJECT_NAME_COLLISION;
         }
       }
@@ -762,15 +795,27 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
 		replicated = ReplicatedFile::Create();
 		DokanFileInfo->Context = (ULONG64) replicated;
 	}
-
+	bool file_was_opened = false;
+	bool file_was_created = false; // not needed really
+	NTSTATUS lastStatus = 0;
 	for(auto& i: *replicated)
 	{
-		i.lastStatus = ReplicatedCreateFile(&i, FileName, SecurityContext, DesiredAccess, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, DokanFileInfo);
+		bool opened = false;
+		i.lastStatus = ReplicatedCreateFile(&i, FileName, SecurityContext, DesiredAccess, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, DokanFileInfo, opened);
+		lastStatus = i.lastStatus;
+		if(opened) file_was_opened = opened;
+		if(!opened) file_was_created = opened;
 	}
-
-	replicated->SynchronizeFT(FileName, DokanFileInfo);
+	if(wcslen(FileName) > 1)
+	{
+		
+		{
+			replicated->IntegrityCheck(FileName,DokanFileInfo);
+		}
+		replicated->SynchronizeFT(FileName, DokanFileInfo);
+	}
 	// TODO: which error
-	return STATUS_SUCCESS;
+	return lastStatus;
 }
 
 
@@ -781,18 +826,17 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
 
 static void DOKAN_CALLBACK ReplicatedCloseFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) 
 {
-  WCHAR filePath[DOKAN_MAX_PATH];
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName );
+  
 
   if (DokanFileInfo->Context) {
-    DbgPrint(L"CloseFile: %s\n", filePath);
+    DbgPrint(L"CloseFile: %s\n", rep_handle->resolved_path.c_str());
     DbgPrint(L"\terror : not cleanuped file\n\n");
     CloseHandle(rep_handle->handle);
 	rep_handle->handle = 0;
 	rep_handle->lastStatus = 0;
   
   } else {
-    DbgPrint(L"Close: %s\n\n", filePath);
+    DbgPrint(L"Close: %s\n\n", rep_handle->resolved_path.c_str());
   }
 
 }
@@ -818,16 +862,15 @@ static void DOKAN_CALLBACK MirrorCloseFile(LPCWSTR FileName, PDOKAN_FILE_INFO Do
 
 static void DOKAN_CALLBACK ReplicatedCleanup(ReplicationHandle* rep_handle, LPCWSTR FileName,
                                          PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[DOKAN_MAX_PATH];
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
 
   if (DokanFileInfo->Context) 
   {
-    DbgPrint(L"Cleanup: %s\n\n", filePath);
+    DbgPrint(L"Cleanup: %s\n\n", rep_handle->resolved_path.c_str());
     CloseHandle((HANDLE)(rep_handle->handle));
     rep_handle->handle = 0;
   } else {
-    DbgPrint(L"Cleanup: %s\n\tinvalid handle\n\n", filePath);
+    DbgPrint(L"Cleanup: %s\n\tinvalid handle\n\n", rep_handle->resolved_path.c_str());
   }
 
   if (DokanFileInfo->DeleteOnClose) 
@@ -837,14 +880,14 @@ static void DOKAN_CALLBACK ReplicatedCleanup(ReplicationHandle* rep_handle, LPCW
     DbgPrint(L"\tDeleteOnClose\n");
     if (DokanFileInfo->IsDirectory) {
       DbgPrint(L"  DeleteDirectory ");
-      if (!RemoveDirectory(filePath)) {
+      if (!RemoveDirectory(rep_handle->resolved_path.c_str())) {
         DbgPrint(L"error code = %d\n\n", GetLastError());
       } else {
         DbgPrint(L"success\n\n");
       }
     } else {
       DbgPrint(L"  DeleteFile ");
-      if (DeleteFile(filePath) == 0) {
+      if (DeleteFile(rep_handle->resolved_path.c_str()) == 0) {
         DbgPrint(L" error code = %d\n\n", GetLastError());
       } else {
         DbgPrint(L"success\n\n");
@@ -881,18 +924,18 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedReadFile(ReplicationHandle* rep_handle,
                                               PDOKAN_FILE_INFO DokanFileInfo) 
 {
   UNREFERENCED_PARAMETER(DokanFileInfo);
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   HANDLE handle = rep_handle->handle;
   ULONG offset = (ULONG)Offset;
   BOOL opened = FALSE;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
 
-  DbgPrint(L"ReadFile : %s\n", filePath);
+  DbgPrint(L"ReadFile : %s\n", rep_handle->resolved_path.c_str());
 
   if (!handle || handle == INVALID_HANDLE_VALUE) {
     DbgPrint(L"\tinvalid handle, cleanuped?\n");
-    handle = CreateFile(filePath, GENERIC_READ, FILE_SHARE_READ, NULL,
+    handle = CreateFile(rep_handle->resolved_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
                         OPEN_EXISTING, 0, NULL);
     if (handle == INVALID_HANDLE_VALUE) {
       DWORD error = GetLastError();
@@ -956,19 +999,19 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedWriteFile(ReplicationHandle* rep_handle
                                                LPDWORD NumberOfBytesWritten,
                                                LONGLONG Offset,
                                                PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   HANDLE handle = rep_handle->handle;
   BOOL opened = FALSE;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
 
-  DbgPrint(L"WriteFile : %s, offset %I64d, length %d\n", filePath, Offset,
+  DbgPrint(L"WriteFile : %s, offset %I64d, length %d\n", rep_handle->resolved_path.c_str(), Offset,
            NumberOfBytesToWrite);
 
   // reopen the file
   if (!handle || handle == INVALID_HANDLE_VALUE) {
     DbgPrint(L"\tinvalid handle, cleanuped?\n");
-    handle = CreateFile(filePath, GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
+    handle = CreateFile(rep_handle->resolved_path.c_str(), GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
                         OPEN_EXISTING, 0, NULL);
     if (handle == INVALID_HANDLE_VALUE) {
       DWORD error = GetLastError();
@@ -1084,12 +1127,12 @@ static NTSTATUS DOKAN_CALLBACK MirrorWriteFile(LPCWSTR FileName, LPCVOID Buffer,
 static NTSTATUS DOKAN_CALLBACK ReplicatedFlushFileBuffers(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) 
 {
 	UNREFERENCED_PARAMETER(DokanFileInfo);
-	WCHAR filePath[DOKAN_MAX_PATH];
+	
 	HANDLE handle = rep_handle->handle;
 
-	rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+	
 
-	DbgPrint(L"FlushFileBuffers : %s\n", filePath);
+	DbgPrint(L"FlushFileBuffers : %s\n", rep_handle->resolved_path.c_str());
 
 	if (!handle || handle == INVALID_HANDLE_VALUE) 
 	{
@@ -1132,17 +1175,17 @@ static NTSTATUS DOKAN_CALLBACK MirrorFlushFileBuffers(LPCWSTR FileName, PDOKAN_F
 static NTSTATUS DOKAN_CALLBACK ReplicatedGetFileInformation( ReplicationHandle* rep_handle, LPCWSTR FileName, LPBY_HANDLE_FILE_INFORMATION HandleFileInformation, PDOKAN_FILE_INFO DokanFileInfo) 
 {
   UNREFERENCED_PARAMETER(DokanFileInfo);
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   HANDLE handle = rep_handle->handle;
   BOOL opened = FALSE;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
 
-  DbgPrint(L"GetFileInfo : %s\n", filePath);
+  DbgPrint(L"GetFileInfo : %s\n", rep_handle->resolved_path.c_str());
 
   if (!handle || handle == INVALID_HANDLE_VALUE) {
     DbgPrint(L"\tinvalid handle, cleanuped?\n");
-    handle = CreateFile(filePath, GENERIC_READ, FILE_SHARE_READ, NULL,
+    handle = CreateFile(rep_handle->resolved_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
                         OPEN_EXISTING, 0, NULL);
     if (handle == INVALID_HANDLE_VALUE) {
       DWORD error = GetLastError();
@@ -1159,12 +1202,12 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedGetFileInformation( ReplicationHandle* 
     // in this case, FindFirstFile can't get directory information
     if (wcslen(FileName) == 1) {
       DbgPrint(L"  root dir\n");
-      HandleFileInformation->dwFileAttributes = GetFileAttributes(filePath);
+      HandleFileInformation->dwFileAttributes = GetFileAttributes(rep_handle->resolved_path.c_str());
 
     } else {
       WIN32_FIND_DATAW find;
       ZeroMemory(&find, sizeof(WIN32_FIND_DATAW));
-      HANDLE findHandle = FindFirstFile(filePath, &find);
+      HANDLE findHandle = FindFirstFile(rep_handle->resolved_path.c_str(), &find);
       if (findHandle == INVALID_HANDLE_VALUE) {
         DWORD error = GetLastError();
         DbgPrint(L"\tFindFirstFile error code = %d\n\n", error);
@@ -1203,14 +1246,14 @@ ReplicatedFile* replicated = (ReplicatedFile*) DokanFileInfo->Context;
 		replicated = ReplicatedFile::Create();
 		DokanFileInfo->Context = (ULONG64) replicated;
 	}
-
+	NTSTATUS someStatus = STATUS_SUCCESS;
 	for(auto& i: *replicated)
 	{
 		i.lastStatus = ReplicatedGetFileInformation(&i, FileName, HandleFileInformation, DokanFileInfo);
+		someStatus = i.lastStatus;
 	}
 
-	// TODO: which error
-	return STATUS_SUCCESS;
+	return someStatus;
 }
 
 
@@ -1225,7 +1268,7 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedFindFiles( ReplicationHandle* rep_handl
   DWORD error;
   int count = 0;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+    rep_handle->resolved_path.copy(filePath,DOKAN_MAX_PATH);
 
   DbgPrint(L"FindFiles : %s\n", filePath);
 
@@ -1290,13 +1333,13 @@ static NTSTATUS DOKAN_CALLBACK MirrorFindFiles(LPCWSTR FileName, PFillFindData F
 
 static NTSTATUS DOKAN_CALLBACK ReplicatedDeleteFile(ReplicationHandle* rep_handle, LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) 
 {
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   HANDLE handle = rep_handle->handle;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
-  DbgPrint(L"DeleteFile %s - %d\n", filePath, DokanFileInfo->DeleteOnClose);
+  
+  DbgPrint(L"DeleteFile %s - %d\n", rep_handle->resolved_path.c_str(), DokanFileInfo->DeleteOnClose);
 
-  DWORD dwAttrib = GetFileAttributes(filePath);
+  DWORD dwAttrib = GetFileAttributes(rep_handle->resolved_path.c_str());
 
   if (dwAttrib != INVALID_FILE_ATTRIBUTES &&
       (dwAttrib & FILE_ATTRIBUTE_DIRECTORY))
@@ -1342,7 +1385,8 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedDeleteDirectory(ReplicationHandle* rep_
   size_t fileLen;
 
   ZeroMemory(filePath, sizeof(filePath));
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
+  rep_handle->resolved_path.copy(filePath,DOKAN_MAX_PATH);
 
   DbgPrint(L"DeleteDirectory %s - %d\n", filePath,
            DokanFileInfo->DeleteOnClose);
@@ -1417,9 +1461,9 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedMoveFile(ReplicationHandle* rep_handle,
   size_t newFilePathLen;
 
   PFILE_RENAME_INFO renameInfo = NULL;
-
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
-  rep_handle->GetFilePath(newFilePath, DOKAN_MAX_PATH, NewFileName);
+    
+  rep_handle->MakeFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  rep_handle->MakeFilePath(newFilePath, DOKAN_MAX_PATH, NewFileName);
 
   DbgPrint(L"MoveFile %s -> %s\n\n", filePath, newFilePath);
   handle = rep_handle->handle;
@@ -1460,6 +1504,7 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedMoveFile(ReplicationHandle* rep_handle,
   free(renameInfo);
 
   if (result) {
+	  rep_handle->resolved_path = newFilePath;
     return STATUS_SUCCESS;
   } else {
     DWORD error = GetLastError();
@@ -1496,7 +1541,7 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedLockFile(ReplicationHandle* rep_handle,
   LARGE_INTEGER offset;
   LARGE_INTEGER length;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  rep_handle->MakeFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"LockFile %s\n", filePath);
 
@@ -1546,7 +1591,7 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedSetEndOfFile( ReplicationHandle* rep_ha
   HANDLE handle;
   LARGE_INTEGER offset;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  rep_handle->MakeFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"SetEndOfFile %s, %I64d\n", filePath, ByteOffset);
 
@@ -1597,13 +1642,13 @@ ReplicatedFile* replicated = (ReplicatedFile*) DokanFileInfo->Context;
 static NTSTATUS DOKAN_CALLBACK ReplicatedSetAllocationSize( ReplicationHandle* rep_handle, LPCWSTR FileName, LONGLONG AllocSize, PDOKAN_FILE_INFO DokanFileInfo) 
 {
 	UNREFERENCED_PARAMETER(DokanFileInfo);
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   HANDLE handle;
   LARGE_INTEGER fileSize;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
-  DbgPrint(L"SetAllocationSize %s, %I64d\n", filePath, AllocSize);
+
+  DbgPrint(L"SetAllocationSize %s, %I64d\n", rep_handle->resolved_path.c_str(), AllocSize);
 
   handle = rep_handle->handle;
   if (!handle || handle == INVALID_HANDLE_VALUE) {
@@ -1660,14 +1705,13 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedSetFileAttributes( ReplicationHandle* r
 {
   UNREFERENCED_PARAMETER(DokanFileInfo);
 
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
-
-  DbgPrint(L"SetFileAttributes %s 0x%x\n", filePath, FileAttributes);
+  
+  DbgPrint(L"SetFileAttributes %s 0x%x\n", rep_handle->resolved_path.c_str(), FileAttributes);
 
   if (FileAttributes != 0) {
-    if (!SetFileAttributes(filePath, FileAttributes)) {
+    if (!SetFileAttributes(rep_handle->resolved_path.c_str(), FileAttributes)) {
       DWORD error = GetLastError();
       DbgPrint(L"\terror code = %d\n\n", error);
       return DokanNtStatusFromWin32(error);
@@ -1706,12 +1750,8 @@ ReplicatedFile* replicated = (ReplicatedFile*) DokanFileInfo->Context;
 static NTSTATUS DOKAN_CALLBACK ReplicatedSetFileTime( ReplicationHandle* rep_handle, LPCWSTR FileName, CONST FILETIME *CreationTime, CONST FILETIME *LastAccessTime, CONST FILETIME *LastWriteTime, PDOKAN_FILE_INFO DokanFileInfo) 
 {
 	UNREFERENCED_PARAMETER(DokanFileInfo);
-  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
-
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
-
-  DbgPrint(L"SetFileTime %s\n", filePath);
+  DbgPrint(L"SetFileTime %s\n", rep_handle->resolved_path.c_str());
 
   handle = rep_handle->handle;
 
@@ -1801,14 +1841,14 @@ static NTSTATUS DOKAN_CALLBACK MirrorUnlockFile(LPCWSTR FileName, LONGLONG ByteO
 
 static NTSTATUS DOKAN_CALLBACK ReplicatedGetFileSecurity(ReplicationHandle* rep_handle,  LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation, PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG BufferLength, PULONG LengthNeeded, PDOKAN_FILE_INFO DokanFileInfo) 
 {
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   BOOLEAN requestingSaclInfo;
 
   UNREFERENCED_PARAMETER(DokanFileInfo);
 
-	rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+	
 
-  DbgPrint(L"GetFileSecurity %s\n", filePath);
+  DbgPrint(L"GetFileSecurity %s\n", rep_handle->resolved_path.c_str());
 
   MirrorCheckFlag(*SecurityInformation, FILE_SHARE_READ);
   MirrorCheckFlag(*SecurityInformation, OWNER_SECURITY_INFORMATION);
@@ -1836,7 +1876,7 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedGetFileSecurity(ReplicationHandle* rep_
 
   DbgPrint(L"  Opening new handle with READ_CONTROL access\n");
   HANDLE handle = CreateFile(
-      filePath,
+      rep_handle->resolved_path.c_str(),
       READ_CONTROL | ((requestingSaclInfo && g_HasSeSecurityPrivilege)
                           ? ACCESS_SYSTEM_SECURITY
                           : 0),
@@ -1900,13 +1940,13 @@ static NTSTATUS DOKAN_CALLBACK ReplicatedSetFileSecurity( ReplicationHandle* rep
 {
 	UNREFERENCED_PARAMETER(DokanFileInfo);
   HANDLE handle;
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
 
   UNREFERENCED_PARAMETER(SecurityDescriptorLength);
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
 
-  DbgPrint(L"SetFileSecurity %s\n", filePath);
+  DbgPrint(L"SetFileSecurity %s\n", rep_handle->resolved_path.c_str());
 
   handle = rep_handle->handle;
   if (!handle || handle == INVALID_HANDLE_VALUE) {
@@ -2049,17 +2089,17 @@ NTSYSCALLAPI NTSTATUS NTAPI NtQueryInformationFile(
 NTSTATUS DOKAN_CALLBACK
 ReplicatedFindStreams(ReplicationHandle* rep_handle, LPCWSTR FileName, PFillFindStreamData FillFindStreamData,
                   PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[DOKAN_MAX_PATH];
+  
   HANDLE hFind;
   WIN32_FIND_STREAM_DATA findData;
   DWORD error;
   int count = 0;
 
-  rep_handle->GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  
 
-  DbgPrint(L"FindStreams :%s\n", filePath);
+  DbgPrint(L"FindStreams :%s\n", rep_handle->resolved_path.c_str());
 
-  hFind = FindFirstStreamW(filePath, FindStreamInfoStandard, &findData, 0);
+  hFind = FindFirstStreamW(rep_handle->resolved_path.c_str(), FindStreamInfoStandard, &findData, 0);
 
   if (hFind == INVALID_HANDLE_VALUE) {
     error = GetLastError();
@@ -2083,7 +2123,7 @@ ReplicatedFindStreams(ReplicationHandle* rep_handle, LPCWSTR FileName, PFillFind
     return DokanNtStatusFromWin32(error);
   }
 
-  DbgPrint(L"\tFindStreams return %d entries in %s\n\n", count, filePath);
+  DbgPrint(L"\tFindStreams return %d entries in %s\n\n", count, rep_handle->resolved_path.c_str());
 
   return STATUS_SUCCESS;
 }
